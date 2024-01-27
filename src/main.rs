@@ -1,21 +1,16 @@
-use std::{
-    env,
-    str::FromStr,
-    sync::{Arc, RwLock},
-};
+use std::{env, str::FromStr, sync::Arc};
 
 use env_logger::Env;
 use log::{debug, info, warn};
 use opcua::{
-    client::prelude::{
-        Client, ClientConfig, DataChangeCallback, IdentityToken, MonitoredItemService, Session,
-        SubscriptionService,
-    },
+    client::prelude::{Client, ClientConfig, IdentityToken, Session, ViewService},
     core::comms::url::is_opc_ua_binary_url,
     crypto::SecurityPolicy,
+    sync::RwLock,
     types::{
-        ApplicationDescription, DataValue, EndpointDescription, MessageSecurityMode, NodeId,
-        TimestampsToReturn, UserTokenPolicy,
+        ApplicationDescription, BrowseDescription, BrowseDescriptionResultMask, BrowseDirection,
+        BrowseResult, EndpointDescription, MessageSecurityMode, NodeClassMask, NodeId,
+        ReferenceTypeId, UserTokenPolicy,
     },
 };
 
@@ -75,12 +70,8 @@ fn main() -> Result<(), Errr> {
                     IdentityToken::Anonymous,
                 )?;
 
-                debug!(">>> Subscribing...");
-                sub(session.clone());
-
-                warn!(">>> Listening...");
-                // Synchronously runs a polling loop over the supplied session.
-                Session::run(session)
+                debug!(">>> Browsing...");
+                browse(session, NodeId::root_folder_id())?;
             }
         }
     }
@@ -88,38 +79,62 @@ fn main() -> Result<(), Errr> {
     Ok(())
 }
 
-fn sub(session: Arc<RwLock<Session>>) -> Result<(), Errr> {
-    let session = session.read()?;
+fn browse(session: Arc<RwLock<Session>>, node_id: NodeId) -> Result<(), Errr> {
+    let rlock = session.read();
+    let Some(res) = rlock.browse(&[BrowseDescription {
+        node_id,
+        browse_direction: BrowseDirection::Both,
+        reference_type_id: ReferenceTypeId::HierarchicalReferences.into(),
+        include_subtypes: true,
+        node_class_mask: NodeClassMask::all().bits(),
+        result_mask: BrowseDescriptionResultMask::all().bits(),
+    }])?
+    else {
+        return Ok(());
+    };
 
-    let subscription_id = session.create_subscription(
-        2000.0, // publishing_interval
-        10,     // lifetime_count
-        30,     // max_keep_alive_count
-        0,      // max_notifications_per_publish
-        0,      // priority
-        true,   // publishing_enabled
-        DataChangeCallback::new(|changed_monitored_items| {
-            info!(">>> Got a change notif! {changed_monitored_items:?}");
-            for &item in changed_monitored_items {
-                let node_id = &item.item_to_monitor().node_id;
-                let DataValue { value, status, .. } = item.last_value();
-                info!(">>>> Item {node_id} value:{value:?} err:{status:?}");
+    do_browse(session.clone(), &res)
+}
+
+#[test]
+fn wth_typing_exists_for_a_reason() {
+    use opcua::types::{BrowseResultMask, NodeClass};
+
+    assert_eq!(63, BrowseDescriptionResultMask::all().bits());
+    assert_eq!(63, BrowseResultMask::All as u32);
+    assert_eq!(255, NodeClassMask::all().bits());
+    assert_eq!(0, NodeClass::Unspecified as u32);
+}
+
+fn do_browse(session: Arc<RwLock<Session>>, res: &[BrowseResult]) -> Result<(), Errr> {
+    for BrowseResult { references, continuation_point, .. } in res {
+        if let Some(references) = references {
+            for r in references {
+                info!(">>> reference={r:?}");
+
+                // e.g.
+                // ReferenceDescription {
+                //     reference_type_id: NodeId { namespace: 0, identifier: Numeric(35) },
+                //     is_forward: true,
+                //     node_id: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(85) }, namespace_uri: UAString { value: None }, server_index: 0 },
+                //     browse_name: QualifiedName { namespace_index: 0, name: UAString { value: Some("Objects") } },
+                //     display_name: LocalizedText { locale: UAString { value: None }, text: UAString { value: Some("Objects") } },
+                //     node_class: Object,
+                //     type_definition: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(61) }, namespace_uri: UAString { value: None }, server_index: 0 }
+                // }
+
+                browse(session.clone(), r.node_id.node_id.clone())?;
             }
-        }),
-    )?;
-    debug!(">>> Created subscription {subscription_id}");
+        }
 
-    info!(">>> Using subscription to monitor root node");
-    let _ = session.create_monitored_items(
-        subscription_id,
-        TimestampsToReturn::Both,
-        &[
-            NodeId::root_folder_id().into(),
-            NodeId::objects_folder_id().into(),
-            NodeId::types_folder_id().into(),
-            NodeId::views_folder_id().into(),
-        ],
-    )?;
+        if !continuation_point.is_null() {
+            let rlock = session.read();
+            let Some(res) = rlock.browse_next(false, &[continuation_point.clone()])? else {
+                continue;
+            };
+            do_browse(session.clone(), &res)?; // TODO: acc vec + tail call
+        }
+    }
 
     Ok(())
 }
