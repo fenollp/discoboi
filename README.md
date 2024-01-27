@@ -16,5 +16,5 @@ mv -v my_private_key.pem pki/private/private.pem
 ```
 
 ```shell
-RUST_LOG=debug OPC_URL=opc.tcp://192.168.your.ip:4840/ cargo run --locked --frozen --offline -- 
+RUST_LOG=debug,opcua=info OPC_URL=opc.tcp://192.168.your.ip:4840/UADiscovery cargo run --locked --frozen --offline -- 
 ```
