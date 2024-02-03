@@ -1,9 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
 use env_logger::Env;
 use log::{debug, info, warn};
@@ -14,7 +9,7 @@ use opcua::{
     sync::RwLock,
     types::{
         ApplicationDescription, BrowseDescription, BrowseDescriptionResultMask, BrowseDirection,
-        BrowseResult, EndpointDescription, MessageSecurityMode, NodeClassMask, NodeId,
+        BrowseResult, EndpointDescription, MessageSecurityMode, NodeClass, NodeClassMask, NodeId,
         ReferenceDescription, ReferenceTypeId, UserTokenPolicy,
     },
 };
@@ -84,15 +79,15 @@ fn main() -> Result<(), Errr> {
     Ok(())
 }
 
-type Nodes = HashMap<NodeId, ()>;
+type Nodes = HashMap<NodeId, (NodeClass, String, NodeId)>;
 
 fn browse(session: Arc<RwLock<Session>>) -> Result<(), Errr> {
-    let node_id = NodeId::root_folder_id();
-    let mut map = [(node_id.clone(), ())].into();
-    browse_node(session.clone(), node_id, &mut map)?;
-    log::info!("Found {} nodes:", map.len());
-    for (node_id, _data) in map {
-        log::info!("Node: {node_id}");
+    let mut map = Default::default();
+    browse_node(session.clone(), NodeId::root_folder_id(), &mut map)?;
+
+    info!(">>>> Found {} nodes:", map.len());
+    for (node_id, (class, name, ty)) in map {
+        info!(">>>> Node: {class:?} {name} {node_id} -> {ty}");
     }
     Ok(())
 }
@@ -123,46 +118,40 @@ fn do_browse(
     res: &[BrowseResult],
     map: &mut Nodes,
 ) -> Result<(), Errr> {
-    let mut to_browse: HashSet<NodeId> = Default::default();
+    let continuation_points: Vec<_> = res
+        .iter()
+        .map(|BrowseResult { continuation_point, .. }| continuation_point.clone())
+        .filter(|cp| !cp.is_null())
+        .collect();
 
-    for BrowseResult { references, continuation_point, .. } in res {
-        if let Some(references) = references {
-            for reference in references {
-                // info!(">>> reference {} {reference:?}", RefDescr(reference));
-                info!(">>> reference {}", RefDescr(reference));
+    let nodes: HashMap<_, _> = res
+        .iter()
+        .flat_map(|BrowseResult { references, .. }| {
+            references.clone().unwrap_or_default().into_iter()
+        })
+        .inspect(|reference| debug!(">>> reference {}", RefDescr(reference)))
+        .map(
+            |ReferenceDescription { node_id, browse_name, node_class, type_definition, .. }| {
+                let name = browse_name.name.value().clone().unwrap_or_default();
+                (node_id.node_id.clone(), (node_class, name, type_definition.node_id.clone()))
+            },
+        )
+        .collect();
 
-                // ReferenceDescription {
-                //     reference_type_id: NodeId { namespace: 0, identifier: Numeric(35) },
-                //     is_forward: true,
-                //     node_id: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(85) }, namespace_uri: UAString { value: None }, server_index: 0 },
-                //     browse_name: QualifiedName { namespace_index: 0, name: UAString { value: Some("Objects") } },
-                //     display_name: LocalizedText { locale: UAString { value: None }, text: UAString { value: Some("Objects") } },
-                //     node_class: Object,
-                //     type_definition: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(61) }, namespace_uri: UAString { value: None }, server_index: 0 }
-                // }
-
-                to_browse.insert(reference.node_id.node_id.clone());
-            }
-        }
-
-        if !continuation_point.is_null() {
-            let rlock = session.read();
-            let Some(res) = rlock.browse_next(false, &[continuation_point.clone()])? else {
-                continue;
-            };
-            do_browse(session.clone(), &res, map)?; // TODO: acc vec + tail call
+    if !continuation_points.is_empty() {
+        let rlock = session.read();
+        if let Some(res) = rlock.browse_next(false, &continuation_points)? {
+            do_browse(session.clone(), &res, map)?;
         }
     }
 
-    log::info!("about to browse {}/{} nodes", to_browse.len(), map.len());
-
+    info!("about to browse {}/{} nodes", nodes.len(), map.len());
     // TODO: Stream iter
-    for node_id in to_browse {
-        if !map.contains_key(&node_id) {
-            map.insert(node_id.clone(), ());
-            log::debug!("browsing node {node_id}");
+    for (node_id, node_value) in nodes {
+        if map.insert(node_id.clone(), node_value).is_none() {
+            debug!("browsing node {node_id}");
             browse_node(session.clone(), node_id.clone(), map)?;
-            log::debug!("browsed node {node_id}");
+            debug!("browsed node {node_id}");
         }
     }
 
