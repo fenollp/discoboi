@@ -1,4 +1,9 @@
-use std::{env, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    str::FromStr,
+    sync::Arc,
+};
 
 use env_logger::Env;
 use log::{debug, info, warn};
@@ -10,7 +15,7 @@ use opcua::{
     types::{
         ApplicationDescription, BrowseDescription, BrowseDescriptionResultMask, BrowseDirection,
         BrowseResult, EndpointDescription, MessageSecurityMode, NodeClassMask, NodeId,
-        ReferenceTypeId, UserTokenPolicy,
+        ReferenceDescription, ReferenceTypeId, UserTokenPolicy,
     },
 };
 
@@ -71,7 +76,7 @@ fn main() -> Result<(), Errr> {
                 )?;
 
                 debug!(">>> Browsing...");
-                browse(session, NodeId::root_folder_id())?;
+                browse(session)?;
             }
         }
     }
@@ -79,7 +84,24 @@ fn main() -> Result<(), Errr> {
     Ok(())
 }
 
-fn browse(session: Arc<RwLock<Session>>, node_id: NodeId) -> Result<(), Errr> {
+type Nodes = HashMap<NodeId, ()>;
+
+fn browse(session: Arc<RwLock<Session>>) -> Result<(), Errr> {
+    let node_id = NodeId::root_folder_id();
+    let mut map = [(node_id.clone(), ())].into();
+    browse_node(session.clone(), node_id, &mut map)?;
+    log::info!("Found {} nodes:", map.len());
+    for (node_id, _data) in map {
+        log::info!("Node: {node_id}");
+    }
+    Ok(())
+}
+
+fn browse_node(
+    session: Arc<RwLock<Session>>,
+    node_id: NodeId,
+    map: &mut Nodes,
+) -> Result<(), Errr> {
     let rlock = session.read();
     let Some(res) = rlock.browse(&[BrowseDescription {
         node_id,
@@ -93,7 +115,58 @@ fn browse(session: Arc<RwLock<Session>>, node_id: NodeId) -> Result<(), Errr> {
         return Ok(());
     };
 
-    do_browse(session.clone(), &res)
+    do_browse(session.clone(), &res, map)
+}
+
+fn do_browse(
+    session: Arc<RwLock<Session>>,
+    res: &[BrowseResult],
+    map: &mut Nodes,
+) -> Result<(), Errr> {
+    let mut to_browse: HashSet<NodeId> = Default::default();
+
+    for BrowseResult { references, continuation_point, .. } in res {
+        if let Some(references) = references {
+            for reference in references {
+                // info!(">>> reference {} {reference:?}", RefDescr(reference));
+                info!(">>> reference {}", RefDescr(reference));
+
+                // ReferenceDescription {
+                //     reference_type_id: NodeId { namespace: 0, identifier: Numeric(35) },
+                //     is_forward: true,
+                //     node_id: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(85) }, namespace_uri: UAString { value: None }, server_index: 0 },
+                //     browse_name: QualifiedName { namespace_index: 0, name: UAString { value: Some("Objects") } },
+                //     display_name: LocalizedText { locale: UAString { value: None }, text: UAString { value: Some("Objects") } },
+                //     node_class: Object,
+                //     type_definition: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(61) }, namespace_uri: UAString { value: None }, server_index: 0 }
+                // }
+
+                to_browse.insert(reference.node_id.node_id.clone());
+            }
+        }
+
+        if !continuation_point.is_null() {
+            let rlock = session.read();
+            let Some(res) = rlock.browse_next(false, &[continuation_point.clone()])? else {
+                continue;
+            };
+            do_browse(session.clone(), &res, map)?; // TODO: acc vec + tail call
+        }
+    }
+
+    log::info!("about to browse {}/{} nodes", to_browse.len(), map.len());
+
+    // TODO: Stream iter
+    for node_id in to_browse {
+        if !map.contains_key(&node_id) {
+            map.insert(node_id.clone(), ());
+            log::debug!("browsing node {node_id}");
+            browse_node(session.clone(), node_id.clone(), map)?;
+            log::debug!("browsed node {node_id}");
+        }
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -106,35 +179,17 @@ fn wth_typing_exists_for_a_reason() {
     assert_eq!(0, NodeClass::Unspecified as u32);
 }
 
-fn do_browse(session: Arc<RwLock<Session>>, res: &[BrowseResult]) -> Result<(), Errr> {
-    for BrowseResult { references, continuation_point, .. } in res {
-        if let Some(references) = references {
-            for r in references {
-                info!(">>> reference={r:?}");
+struct RefDescr<'a>(&'a ReferenceDescription);
 
-                // e.g.
-                // ReferenceDescription {
-                //     reference_type_id: NodeId { namespace: 0, identifier: Numeric(35) },
-                //     is_forward: true,
-                //     node_id: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(85) }, namespace_uri: UAString { value: None }, server_index: 0 },
-                //     browse_name: QualifiedName { namespace_index: 0, name: UAString { value: Some("Objects") } },
-                //     display_name: LocalizedText { locale: UAString { value: None }, text: UAString { value: Some("Objects") } },
-                //     node_class: Object,
-                //     type_definition: ExpandedNodeId { node_id: NodeId { namespace: 0, identifier: Numeric(61) }, namespace_uri: UAString { value: None }, server_index: 0 }
-                // }
-
-                browse(session.clone(), r.node_id.node_id.clone())?;
-            }
-        }
-
-        if !continuation_point.is_null() {
-            let rlock = session.read();
-            let Some(res) = rlock.browse_next(false, &[continuation_point.clone()])? else {
-                continue;
-            };
-            do_browse(session.clone(), &res)?; // TODO: acc vec + tail call
-        }
+impl<'a> std::fmt::Display for RefDescr<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {:?} {:?} (-> {}) ",
+            self.0.node_id.node_id,
+            self.0.node_class,
+            self.0.browse_name.name.value(),
+            self.0.type_definition.node_id
+        )
     }
-
-    Ok(())
 }
