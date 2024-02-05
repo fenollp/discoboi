@@ -1,21 +1,16 @@
-use std::{
-    env,
-    str::FromStr,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
 use env_logger::Env;
 use log::{debug, info, warn};
 use opcua::{
-    client::prelude::{
-        Client, ClientConfig, DataChangeCallback, IdentityToken, MonitoredItemService, Session,
-        SubscriptionService,
-    },
+    client::prelude::{Client, ClientConfig, IdentityToken, Session, ViewService},
     core::comms::url::is_opc_ua_binary_url,
     crypto::SecurityPolicy,
+    sync::RwLock,
     types::{
-        ApplicationDescription, DataValue, EndpointDescription, MessageSecurityMode, NodeId,
-        TimestampsToReturn, UserTokenPolicy,
+        ApplicationDescription, BrowseDescription, BrowseDescriptionResultMask, BrowseDirection,
+        BrowseResult, EndpointDescription, MessageSecurityMode, NodeClass, NodeClassMask, NodeId,
+        ReferenceDescription, ReferenceTypeId, UserTokenPolicy,
     },
 };
 
@@ -75,12 +70,8 @@ fn main() -> Result<(), Errr> {
                     IdentityToken::Anonymous,
                 )?;
 
-                debug!(">>> Subscribing...");
-                sub(session.clone());
-
-                warn!(">>> Listening...");
-                // Synchronously runs a polling loop over the supplied session.
-                Session::run(session)
+                debug!(">>> Browsing...");
+                browse(session)?;
             }
         }
     }
@@ -88,38 +79,106 @@ fn main() -> Result<(), Errr> {
     Ok(())
 }
 
-fn sub(session: Arc<RwLock<Session>>) -> Result<(), Errr> {
-    let session = session.read()?;
+type Nodes = HashMap<NodeId, (NodeClass, String, NodeId)>;
 
-    let subscription_id = session.create_subscription(
-        2000.0, // publishing_interval
-        10,     // lifetime_count
-        30,     // max_keep_alive_count
-        0,      // max_notifications_per_publish
-        0,      // priority
-        true,   // publishing_enabled
-        DataChangeCallback::new(|changed_monitored_items| {
-            info!(">>> Got a change notif! {changed_monitored_items:?}");
-            for &item in changed_monitored_items {
-                let node_id = &item.item_to_monitor().node_id;
-                let DataValue { value, status, .. } = item.last_value();
-                info!(">>>> Item {node_id} value:{value:?} err:{status:?}");
-            }
-        }),
-    )?;
-    debug!(">>> Created subscription {subscription_id}");
+fn browse(session: Arc<RwLock<Session>>) -> Result<(), Errr> {
+    let mut map = Default::default();
+    browse_node(session.clone(), NodeId::root_folder_id(), &mut map)?;
 
-    info!(">>> Using subscription to monitor root node");
-    let _ = session.create_monitored_items(
-        subscription_id,
-        TimestampsToReturn::Both,
-        &[
-            NodeId::root_folder_id().into(),
-            NodeId::objects_folder_id().into(),
-            NodeId::types_folder_id().into(),
-            NodeId::views_folder_id().into(),
-        ],
-    )?;
+    info!(">>>> Found {} nodes:", map.len());
+    for (node_id, (class, name, ty)) in map {
+        info!(">>>> Node: {class:?} {name} {node_id} -> {ty}");
+    }
+    Ok(())
+}
+
+fn browse_node(
+    session: Arc<RwLock<Session>>,
+    node_id: NodeId,
+    map: &mut Nodes,
+) -> Result<(), Errr> {
+    let rlock = session.read();
+    let Some(res) = rlock.browse(&[BrowseDescription {
+        node_id,
+        browse_direction: BrowseDirection::Both,
+        reference_type_id: ReferenceTypeId::HierarchicalReferences.into(),
+        include_subtypes: true,
+        node_class_mask: NodeClassMask::all().bits(),
+        result_mask: BrowseDescriptionResultMask::all().bits(),
+    }])?
+    else {
+        return Ok(());
+    };
+
+    do_browse(session.clone(), &res, map)
+}
+
+fn do_browse(
+    session: Arc<RwLock<Session>>,
+    res: &[BrowseResult],
+    map: &mut Nodes,
+) -> Result<(), Errr> {
+    let continuation_points: Vec<_> = res
+        .iter()
+        .map(|BrowseResult { continuation_point, .. }| continuation_point.clone())
+        .filter(|cp| !cp.is_null())
+        .collect();
+
+    let nodes: HashMap<_, _> = res
+        .iter()
+        .flat_map(|BrowseResult { references, .. }| {
+            references.clone().unwrap_or_default().into_iter()
+        })
+        .inspect(|reference| debug!(">>> reference {}", RefDescr(reference)))
+        .map(
+            |ReferenceDescription { node_id, browse_name, node_class, type_definition, .. }| {
+                let name = browse_name.name.value().clone().unwrap_or_default();
+                (node_id.node_id.clone(), (node_class, name, type_definition.node_id.clone()))
+            },
+        )
+        .collect();
+
+    if !continuation_points.is_empty() {
+        let rlock = session.read();
+        if let Some(res) = rlock.browse_next(false, &continuation_points)? {
+            do_browse(session.clone(), &res, map)?;
+        }
+    }
+
+    info!("about to browse {}/{} nodes", nodes.len(), map.len());
+    // TODO: Stream iter
+    for (node_id, node_value) in nodes {
+        if map.insert(node_id.clone(), node_value).is_none() {
+            debug!("browsing node {node_id}");
+            browse_node(session.clone(), node_id.clone(), map)?;
+            debug!("browsed node {node_id}");
+        }
+    }
 
     Ok(())
+}
+
+#[test]
+fn wth_typing_exists_for_a_reason() {
+    use opcua::types::{BrowseResultMask, NodeClass};
+
+    assert_eq!(63, BrowseDescriptionResultMask::all().bits());
+    assert_eq!(63, BrowseResultMask::All as u32);
+    assert_eq!(255, NodeClassMask::all().bits());
+    assert_eq!(0, NodeClass::Unspecified as u32);
+}
+
+struct RefDescr<'a>(&'a ReferenceDescription);
+
+impl<'a> std::fmt::Display for RefDescr<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {:?} {:?} (-> {}) ",
+            self.0.node_id.node_id,
+            self.0.node_class,
+            self.0.browse_name.name.value(),
+            self.0.type_definition.node_id
+        )
+    }
 }
